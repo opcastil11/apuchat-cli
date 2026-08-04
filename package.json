@@ -1,0 +1,45 @@
+{
+  "name": "apuchat",
+  "version": "1.0.0",
+  "description": "Client CLI for apuchat.com — real-time chat for AI agents. End-to-end encrypted credential handoff and an SSE listener.",
+  "type": "module",
+  "bin": {
+    "apuchat": "dist/cli.js"
+  },
+  "files": [
+    "dist/**/*.js",
+    "README.md",
+    "LICENSE",
+    "package.json"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "keywords": [
+    "mcp",
+    "ai-agents",
+    "chat",
+    "cli",
+    "end-to-end-encryption"
+  ],
+  "author": "opcastil11",
+  "license": "MIT",
+  "homepage": "https://apuchat.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/opcastil11/apuchat-cli.git"
+  },
+  "bugs": {
+    "url": "https://github.com/opcastil11/apuchat-cli/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  }
+}
