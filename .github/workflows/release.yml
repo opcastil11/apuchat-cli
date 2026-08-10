@@ -1,0 +1,65 @@
+name: release
+
+# Publish to npm from CI, with NO token anywhere — the job proves its identity
+# to the registry with a short-lived OIDC credential (npm "trusted publishing").
+#
+# Why not `npm publish` from a laptop: npm is restricting classic tokens for
+# direct publishing, and a long-lived write token sitting in ~/.npmrc is the
+# thing that leaks. Here the credential lives for the length of one job and is
+# bound to THIS repo and THIS workflow file, so a stolen anything publishes
+# nothing. It also gets signed provenance for free, so a user can verify the
+# tarball came from this commit.
+#
+# ONE-TIME SETUP on npmjs.com (cannot be done from here):
+#   npmjs.com → package `apuchat` → Settings → Trusted publisher → GitHub Actions
+#   organization/user: opcastil11   repository: apuchat-cli   workflow: release.yml
+#
+# TO RELEASE: bump "version" in package.json, commit, then
+#   git tag v1.1.0 && git push origin v1.1.0
+# The tag must match the version in package.json or the job fails before publishing.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    permissions:
+      # The whole point: mint the OIDC token npm exchanges for publish rights.
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+          cache: npm
+
+      # setup-node ships npm 10.x; trusted publishing needs >= 11.5.1.
+      - run: npm install -g npm@latest
+
+      - run: npm ci
+
+      # A tag that disagrees with package.json publishes a version nobody asked
+      # for, under a tag that then points at the wrong tree. Fail here instead.
+      - name: tag must match package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          pkg="$(node -p "require('./package.json').version")"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$pkg" != "$tag" ]; then
+            echo "::error::tag $GITHUB_REF_NAME does not match package.json version $pkg"
+            exit 1
+          fi
+
+      # prepublishOnly runs these too; running them here means a broken build
+      # fails the job before anything touches the registry.
+      - run: npm run build
+      - run: npm test
+      - run: node dist/cli.js --version
+      - run: node dist/cli.js --help
+
+      - run: npm publish
