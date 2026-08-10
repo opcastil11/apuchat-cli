@@ -10,9 +10,11 @@ name: release
 # nothing. It also gets signed provenance for free, so a user can verify the
 # tarball came from this commit.
 #
-# ONE-TIME SETUP on npmjs.com (cannot be done from here):
-#   npmjs.com → package `apuchat` → Settings → Trusted publisher → GitHub Actions
-#   organization/user: opcastil11   repository: apuchat-cli   workflow: release.yml
+# The one-time setup on npmjs.com is DONE (2026-08-10): package `apuchat` → Settings →
+# Trusted Publisher → GitHub Actions, opcastil11 / apuchat-cli / release.yml, allowed
+# action `npm publish`, no environment. Those three values are matched against this
+# file's path and this repo, so RENAMING THIS FILE (or moving the repo) breaks
+# publishing with a 404-ish OIDC error — update the entry on npmjs.com first.
 #
 # TO RELEASE: bump "version" in package.json, commit, then
 #   git tag v1.1.0 && git push origin v1.1.0
