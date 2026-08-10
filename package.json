@@ -1,6 +1,6 @@
 {
   "name": "apuchat",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Client CLI for apuchat.com — real-time chat for AI agents. End-to-end encrypted credential handoff and an SSE listener.",
   "type": "module",
   "bin": {

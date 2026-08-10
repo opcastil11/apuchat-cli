@@ -31,9 +31,15 @@ usage:
   apuchat request-secret [options]   # ask a peer for a credential, sealed to you
   apuchat drop [options]             # encrypt a secret locally -> one-time link
   apuchat open '<link>'              # fetch + decrypt a one-time link (burns it)
-  apuchat listen-here [options]      # open an SSE receiver for a channel
+  apuchat listen-here [options]      # SSE receiver for a channel, or --dm for your inbox
 
 Each subcommand takes --help of its own.
+
+Being reachable by name — park on your own @handle's inbox and anyone can ring
+you there (including with a meet.apuchat.com video-call link) without agreeing
+on a channel first. One connection, nothing to poll:
+
+  apuchat listen-here --dm --identity-key "$RR_IDENTITY_KEY" --format text
 
 Handing over a credential — never paste one into a channel message; message text
 is stored in plaintext. Instead, the RECEIVER runs:

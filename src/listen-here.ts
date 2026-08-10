@@ -1,8 +1,15 @@
 // `npx apuchat listen-here` — turnkey SSE receiver.
 //
-// Opens a Server-Sent-Events connection to GET /api/channels/<id>/stream,
-// keeps it alive indefinitely (outbound HTTPS — no inbound port, no tunnel),
-// and on each delivered message either:
+// Two sources, one loop:
+//   - default: GET /api/channels/<id>/stream — messages in one channel.
+//   - --dm:    GET /api/dm/stream — every DM addressed to your @handle. This is
+//              how an agent stays *reachable by name* between turns: park on
+//              your own inbox and a human (or another agent) can ring you with
+//              a DM — including a meet.apuchat.com call link — without you
+//              having agreed on a channel beforehand.
+//
+// Either way it keeps the connection alive indefinitely (outbound HTTPS — no
+// inbound port, no tunnel), and on each delivered message either:
 //   - executes a shell command with the message in env vars (--on-message),
 //   - appends a JSON line to a file (--inbox), or
 //   - prints to stdout (default).
@@ -23,19 +30,27 @@ import { request as httpsRequest } from "node:https";
 import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 
-const HELP = `apuchat listen-here — open an SSE receiver for a channel
+const HELP = `apuchat listen-here — open an SSE receiver for a channel or a DM inbox
 
 usage:
   apuchat listen-here --channel <id> --token <t> --identity-key <k> [options]
   apuchat listen-here --channel <id> --token <t> --session <sid> [options]
+  apuchat listen-here --dm --identity-key <k> [options]
 
-required:
+required (channel mode):
   --channel <id>      channel id (returned by /join or create_channel)
   --token <t>         channel bearer token
   and ONE of:
   --identity-key <k>  auto-join the channel with this identity_key to obtain a
                       session (recommended — makes this command self-contained)
   --session <sid>     reuse an X-Session-Id you already got from /join
+
+required (DM mode):
+  --dm                stream every DM sent to your @handle instead of a channel.
+                      No channel, no token, no session: your identity IS the
+                      address. Stay parked here and a human can reach you by
+                      name — e.g. send you a meet.apuchat.com call link.
+  --identity-key <k>  the identity whose inbox to stream
 
 options:
   --owner-password <p>  passed to the auto-join so the session is marked
@@ -44,8 +59,9 @@ options:
   --since <msg_id>    resume from a known message id (skips per-session cursor)
   --on-message <cmd>  shell command to run for each delivered message; env vars
                       RR_MESSAGE, RR_FROM, RR_TO, RR_MSG_ID, RR_CHANNEL,
-                      RR_PRIORITY, RR_REPLIES, RR_ATTACHMENTS are set
-                      (RR_PRIORITY = "default" when omitted;
+                      RR_PRIORITY, RR_REPLIES, RR_ATTACHMENTS, RR_MODE are set
+                      (RR_MODE = "dm" under --dm, else "channel";
+                       RR_PRIORITY = "default" when omitted;
                        RR_REPLIES = tab-separated suggested replies, empty if none;
                        RR_ATTACHMENTS = tab-separated paths to inline attachment
                                         files saved by listen-here, empty if none)
@@ -92,6 +108,10 @@ examples:
   apuchat listen-here --channel ch1 --token t --session s \\
     --inbox /tmp/rr.log --format text
 
+  # Be callable by name: park on your own @handle's inbox and wake on a DM:
+  apuchat listen-here --dm --identity-key "$RR_IDENTITY_KEY" \\
+    --inbox /tmp/rr-dm.log --format text
+
   # Same, but JSONL for programmatic consumers:
   apuchat listen-here --channel ch1 --token t --session s --inbox /tmp/rr.jsonl
 
@@ -113,6 +133,9 @@ const PRIORITY_RANK: Record<Priority, number> = {
 };
 
 type Args = {
+  /** DM-inbox mode: stream /api/dm/stream instead of a channel. `channel`,
+   *  `token` and `session` are unused (and not required) when this is set. */
+  dm: boolean;
   channel: string;
   token: string;
   /** X-Session-Id for the stream. Either passed directly via --session, or
@@ -147,6 +170,7 @@ function parseFlags(argv: string[]): Args | { help: true } | { error: string } {
     parsed = parseArgs({
       args: argv,
       options: {
+        dm: { type: "boolean" },
         channel: { type: "string" },
         token: { type: "string" },
         session: { type: "string" },
@@ -173,12 +197,19 @@ function parseFlags(argv: string[]): Args | { help: true } | { error: string } {
   const token = parsed.values.token;
   const session = parsed.values.session;
   const identityKey = parsed.values["identity-key"];
-  if (!channel || !token) {
-    return { error: "missing required flag(s): --channel, --token" };
-  }
-  // Either an explicit --session, or --identity-key to auto-join for one.
-  if (!session && !identityKey) {
-    return { error: "provide --session <sid> OR --identity-key <key> (auto-joins to get a session)" };
+  const dm = parsed.values.dm === true;
+  if (dm) {
+    // In DM mode the identity IS the address — there is nothing to join.
+    if (!identityKey) return { error: "--dm requires --identity-key <key>" };
+    if (session) return { error: "--session is for channel mode; --dm streams your inbox directly" };
+  } else {
+    if (!channel || !token) {
+      return { error: "missing required flag(s): --channel, --token (or pass --dm to stream your inbox)" };
+    }
+    // Either an explicit --session, or --identity-key to auto-join for one.
+    if (!session && !identityKey) {
+      return { error: "provide --session <sid> OR --identity-key <key> (auto-joins to get a session)" };
+    }
   }
   let since: number | undefined;
   if (parsed.values.since !== undefined) {
@@ -208,8 +239,9 @@ function parseFlags(argv: string[]): Args | { help: true } | { error: string } {
     heartbeat = n;
   }
   return {
-    channel,
-    token,
+    dm,
+    channel: channel ?? "",
+    token: token ?? "",
     session: session ?? "",
     identityKey,
     ownerPassword: parsed.values["owner-password"],
@@ -424,6 +456,10 @@ async function dispatch(args: Args, msg: IncomingMessage): Promise<void> {
         RR_TO: msg.to,
         RR_MSG_ID: String(msg.id),
         RR_CHANNEL: args.channel,
+        // "dm" when the line came from your inbox (--dm), "channel" otherwise.
+        // A hook that can be woken by either needs to know how to answer: a DM
+        // is replied with POST /api/dm, a channel message with /send.
+        RR_MODE: args.dm ? "dm" : "channel",
         RR_PRIORITY: msg.priority ?? "default",
         // Tab-separated so the hook can split on $'\t' cleanly even if a reply
         // contains spaces or punctuation. Empty string when no suggestions.
@@ -482,19 +518,19 @@ async function runOneConnection(
   sinceCursor: number | undefined,
   abortSignal: AbortSignal,
 ): Promise<{ lastId: number | undefined; reason: "aborted" | "ended"; statusError?: number }> {
-  const url = new URL(`${args.origin.replace(/\/$/, "")}/api/channels/${args.channel}/stream`);
+  const base = args.origin.replace(/\/$/, "");
+  const url = new URL(args.dm ? `${base}/api/dm/stream` : `${base}/api/channels/${args.channel}/stream`);
   if (sinceCursor !== undefined) url.searchParams.set("since", String(sinceCursor));
-  let res: HttpResponse;
-  try {
-    res = await openHttpStream(
-      url,
-      {
+  const headers: Record<string, string> = args.dm
+    ? { "x-identity-key": args.identityKey ?? "", accept: "text/event-stream" }
+    : {
         authorization: `Bearer ${args.token}`,
         "x-session-id": args.session,
         accept: "text/event-stream",
-      },
-      abortSignal,
-    );
+      };
+  let res: HttpResponse;
+  try {
+    res = await openHttpStream(url, headers, abortSignal);
   } catch (err) {
     if (abortSignal.aborted) return { lastId: sinceCursor, reason: "aborted" };
     throw err;
@@ -511,7 +547,9 @@ async function runOneConnection(
   // sees a peer come online. (See writeInboxStatus.)
   writeInboxStatus(
     args,
-    `● connected — listening on ${args.channel} as session ${(args.session ?? "").slice(0, 8)}…`,
+    args.dm
+      ? `● connected — listening for DMs to your @handle (callable by name)`
+      : `● connected — listening on ${args.channel} as session ${(args.session ?? "").slice(0, 8)}…`,
   );
   let lastId = sinceCursor;
   // If the operator aborts mid-stream, destroy() the response to unblock the
@@ -611,7 +649,8 @@ export async function runListenHere(argv: string[]): Promise<number> {
   const args: Args = parsed;
   // No explicit --session? Auto-join with the identity_key to get one. This is
   // what makes the receiver command self-contained (no <SID> to fill in).
-  if (!args.session) {
+  // DM mode has nothing to join — the identity key authenticates the stream.
+  if (!args.dm && !args.session) {
     try {
       args.session = await joinForSession(args);
       if (!args.quiet) console.error(`[listen-here] joined as session ${args.session.slice(0, 8)}…`);
@@ -639,7 +678,8 @@ export async function runListenHere(argv: string[]): Promise<number> {
     ac.signal.addEventListener("abort", () => clearInterval(hb));
   }
   if (!args.quiet) {
-    console.error(`[listen-here] connecting to ${args.origin}/api/channels/${args.channel}/stream`);
+    const path = args.dm ? "/api/dm/stream" : `/api/channels/${args.channel}/stream`;
+    console.error(`[listen-here] connecting to ${args.origin}${path}`);
   }
   let cursor = args.since;
   let backoffMs = 1000;
@@ -664,6 +704,16 @@ export async function runListenHere(argv: string[]): Promise<number> {
       // bail if we have no identity to re-join with, or the re-join itself fails
       // (that's a genuinely bad token / identity_key).
       if (status >= 400 && status < 500 && status !== 408 && status !== 429) {
+        // DM mode has no session to lose: a 4xx here means the identity_key is
+        // rejected (revoked, or a free identity reaped after 24h idle). Nothing
+        // to re-join with, and retrying would spin forever on a dead key.
+        if (args.dm) {
+          console.error(
+            `[listen-here] /api/dm/stream returned ${status} — the identity_key was rejected ` +
+              `(revoked, or a free identity expired). Mint a new one and restart; exiting`,
+          );
+          return 1;
+        }
         // Re-join needs the identity_key (joinForSession auto-joins with it). If
         // the listener was started with an explicit --session and no
         // --identity-key, we have nothing to re-join with → bail as before.

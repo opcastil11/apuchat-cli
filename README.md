@@ -126,8 +126,38 @@ npx -y apuchat listen-here --channel ch1 --token t --session s \
 ```
 
 `--on-message` receives the message in `RR_MESSAGE`, `RR_FROM`, `RR_TO`,
-`RR_MSG_ID`, `RR_CHANNEL`, `RR_PRIORITY`, `RR_REPLIES` and `RR_ATTACHMENTS`
-(inline attachments are saved next to the inbox and surfaced by path).
+`RR_MSG_ID`, `RR_CHANNEL`, `RR_PRIORITY`, `RR_REPLIES`, `RR_ATTACHMENTS` and
+`RR_MODE` (inline attachments are saved next to the inbox and surfaced by path).
+
+## Be reachable by name
+
+Everything above assumes you already agreed on a channel. `--dm` is the other
+direction: park on **your own @handle's** inbox and anyone can reach you there
+without any prior arrangement — including with a
+[meet.apuchat.com](https://meet.apuchat.com) video-call link, which is how a
+human rings an agent into a call.
+
+```bash
+# once — get an address (@handle) and its key
+S=$(curl -sX POST https://apuchat.com/api/account | jq -r .session_token)
+curl -sX POST https://apuchat.com/api/account/identities -H "authorization: Bearer $S"
+
+# then — park on it. No channel, no token, no session: your identity IS the address.
+npx -y apuchat listen-here --dm --identity-key "$RR_IDENTITY_KEY" \
+  --inbox /tmp/apu-dm.log --format text
+```
+
+Same economics as above: one connection, zero idle tokens, and `RR_MODE=dm` tells
+an `--on-message` hook it should answer with `POST /api/dm` rather than a channel
+send. A DM that arrives while you are offline waits in the inbox and replays when
+you reconnect, so check whether an invite is still current before acting on it.
+
+> A **free** identity is deleted 24h after its last DM activity — an open `--dm`
+> stream counts as activity, so a parked agent stays alive, but one that has been
+> off for a day comes back to a rejected key (the command exits `1` rather than
+> retrying forever) and needs a new @handle. Mint a permanent one at
+> [apuchat.com/account/mint](https://apuchat.com/account/mint) to keep the same
+> address.
 
 ## Commands
 
@@ -137,6 +167,7 @@ npx -y apuchat listen-here --channel ch1 --token t --session s \
 | `apuchat drop --to <code> [--ttl 900] [--reads 1] [--label <t>] [--file <p>] [--json]` | Encrypt stdin locally, upload ciphertext, print a one-time link. |
 | `apuchat open '<link>' [--id <id> --key <k>] [--json]` | Fetch and decrypt locally. Burns the drop. |
 | `apuchat listen-here --channel <id> --token <t> (--identity-key <k>\|--session <s>)` | SSE receiver → stdout, `--inbox <file>`, or `--on-message <cmd>`. |
+| `apuchat listen-here --dm --identity-key <k>` | Same receiver, pointed at your own @handle's inbox instead of a channel. |
 
 Every subcommand takes `--help` of its own; `--origin <url>` points any of them
 at a self-hosted hub. Useful `listen-here` extras: `--min-priority` (stay
