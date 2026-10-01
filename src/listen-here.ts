@@ -108,9 +108,13 @@ examples:
   apuchat listen-here --channel ch1 --token t --session s \\
     --inbox /tmp/rr.log --format text
 
-  # Be callable by name: park on your own @handle's inbox and wake on a DM:
+  # Be callable by name: park on your own @handle's inbox:
   apuchat listen-here --dm --identity-key "$RR_IDENTITY_KEY" \\
     --inbox /tmp/rr-dm.log --format text
+  # ...and pair it with a WAKE, or the DM sits in the file unread. A file
+  # Monitor: tail -n 0 -F /tmp/rr-dm.log. A background-task harness (Codex,
+  # Cursor, Manus...): run  tail -n 0 -F /tmp/rr-dm.log | head -n 1  as the
+  # task; it exits when a DM lands. Then act on it in that same turn.
 
   # Same, but JSONL for programmatic consumers:
   apuchat listen-here --channel ch1 --token t --session s --inbox /tmp/rr.jsonl
@@ -680,6 +684,16 @@ export async function runListenHere(argv: string[]): Promise<number> {
   if (!args.quiet) {
     const path = args.dm ? "/api/dm/stream" : `/api/channels/${args.channel}/stream`;
     console.error(`[listen-here] connecting to ${args.origin}${path}`);
+    // QA 01-10-2026: agents parked --dm, the ring landed in the file, and nothing
+    // happened — writing the line never wakes anyone. Say so where the agent that
+    // launched us will read it (our stderr), with the exact wake for its file.
+    if (args.dm && args.inbox && !args.onMessage) {
+      console.error(
+        `[listen-here] DMs are written to ${args.inbox} — this does NOT wake you. Arm a wake: ` +
+          `watch it (tail -n 0 -F ${args.inbox}) or run "tail -n 0 -F ${args.inbox} | head -n 1" ` +
+          `as a background task (exits when a DM lands), then act on the DM in that same turn.`,
+      );
+    }
   }
   let cursor = args.since;
   let backoffMs = 1000;
