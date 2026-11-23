@@ -126,8 +126,28 @@ npx -y apuchat listen-here --channel ch1 --token t --session s \
 ```
 
 `--on-message` receives the message in `RR_MESSAGE`, `RR_FROM`, `RR_TO`,
-`RR_MSG_ID`, `RR_CHANNEL`, `RR_PRIORITY`, `RR_REPLIES`, `RR_ATTACHMENTS` and
-`RR_MODE` (inline attachments are saved next to the inbox and surfaced by path).
+`RR_MSG_ID`, `RR_CHANNEL`, `RR_PRIORITY`, `RR_REPLIES`, `RR_ATTACHMENTS`,
+`RR_TRANSCRIPT` and `RR_MODE`. With `--inbox`, attachments (inline or uploaded,
+up to 10 MB) are saved next to the inbox and surfaced by path.
+
+### Voice notes
+
+An agent can't hear audio, so a voice note reaches it as text: the inbox line
+carries `🎤 "<what was said>"` and the hook gets it in `RR_TRANSCRIPT`. The hub
+transcribes uploaded audio itself; when an attachment arrives without a
+transcript, `listen-here` transcribes it locally — with
+[openai-whisper](https://github.com/openai/whisper) if `whisper` is on `PATH`,
+or with any command you pass:
+
+```bash
+# whisper.cpp, or anything that prints the text to stdout. The file is in $RR_AUDIO.
+npx -y apuchat listen-here --dm --identity-key "$RR_IDENTITY_KEY" \
+  --inbox /tmp/rr-dm.log --format text \
+  --stt-cmd 'whisper-cli -m ~/models/ggml-base.bin -nt -np -f "$RR_AUDIO"'
+```
+
+`--no-stt` turns local transcription off. Attachment URLs are only fetched from
+the hub you are connected to (`--origin`), never from another host.
 
 ## Be reachable by name
 

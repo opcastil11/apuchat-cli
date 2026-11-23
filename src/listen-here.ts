@@ -24,10 +24,11 @@
 // that piled up while we were away.
 
 import { spawn } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { request as httpRequest, type IncomingMessage as HttpResponse } from "node:http";
 import { request as httpsRequest } from "node:https";
-import { basename, dirname, join } from "node:path";
+import { tmpdir } from "node:os";
+import { basename, delimiter, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 
 const HELP = `apuchat listen-here — open an SSE receiver for a channel or a DM inbox
@@ -59,12 +60,14 @@ options:
   --since <msg_id>    resume from a known message id (skips per-session cursor)
   --on-message <cmd>  shell command to run for each delivered message; env vars
                       RR_MESSAGE, RR_FROM, RR_TO, RR_MSG_ID, RR_CHANNEL,
-                      RR_PRIORITY, RR_REPLIES, RR_ATTACHMENTS, RR_MODE are set
+                      RR_PRIORITY, RR_REPLIES, RR_ATTACHMENTS, RR_TRANSCRIPT,
+                      RR_MODE are set
                       (RR_MODE = "dm" under --dm, else "channel";
                        RR_PRIORITY = "default" when omitted;
                        RR_REPLIES = tab-separated suggested replies, empty if none;
-                       RR_ATTACHMENTS = tab-separated paths to inline attachment
-                                        files saved by listen-here, empty if none)
+                       RR_ATTACHMENTS = tab-separated paths to attachment
+                                        files saved by listen-here, empty if none;
+                       RR_TRANSCRIPT = what the voice notes said, one per line)
   --inbox <file>      append each message to this file (parent dir created if
                       missing). Format controlled by --format. When messages
                       carry inline attachments, the binaries are saved into a
@@ -90,6 +93,12 @@ options:
                       consuming a real message. Off by default. Needs --inbox and
                       --format text. (Non-destructive alternative: poll /roster —
                       your callsign present = listener alive.)
+  --stt-cmd <cmd>     transcribe voice notes the hub did not (no transcript on
+                      the attachment) with this shell command. The audio path
+                      is in $RR_AUDIO; whatever the command prints to stdout is
+                      the transcript. Default: the openai-whisper CLI
+                      ('whisper') if it is on PATH, otherwise none. Needs --inbox.
+  --no-stt            never transcribe locally
   --quiet             suppress the default stdout dump of each message
 
 if neither --on-message nor --inbox is given, messages print to stdout (one
@@ -166,6 +175,9 @@ type Args = {
    *  still up WITHOUT consuming a real message (the non-destructive healthcheck
    *  the docs otherwise point at /roster for). Off by default to avoid noise. */
   heartbeat?: number;
+  /** Local speech-to-text for audio that arrives WITHOUT a hub transcript.
+   *  `undefined` = auto (openai-whisper if on PATH), `null` = off (--no-stt). */
+  sttCmd?: string | null;
 };
 
 function parseFlags(argv: string[]): Args | { help: true } | { error: string } {
@@ -188,6 +200,8 @@ function parseFlags(argv: string[]): Args | { help: true } | { error: string } {
         "min-priority": { type: "string" },
         heartbeat: { type: "string" },
         quiet: { type: "boolean" },
+        "stt-cmd": { type: "string" },
+        "no-stt": { type: "boolean" },
         help: { type: "boolean", short: "h" },
       },
       strict: true,
@@ -257,16 +271,27 @@ function parseFlags(argv: string[]): Args | { help: true } | { error: string } {
     quiet: parsed.values.quiet === true,
     minPriority,
     heartbeat,
+    sttCmd: parsed.values["no-stt"] ? null : parsed.values["stt-cmd"],
   };
 }
 
-/** Mirror of the hub's Attachment shape on the wire. data_base64 is the
- *  raw base64 payload (no `data:` prefix). filename is optional and may be
- *  absent on programmatically-generated attachments. */
+/** Mirror of the hub's Attachment shape on the wire. Two kinds:
+ *  - inline: `data_base64` is the raw base64 payload (no `data:` prefix);
+ *  - uploaded (up to 10 MB): no bytes, just `id` + `url` to fetch them from.
+ *  `transcript` is set by the hub on uploaded audio it could transcribe; when
+ *  it is missing, listen-here can transcribe locally (see --stt-cmd).
+ *  filename is optional and may be absent on programmatically-generated ones. */
 type WireAttachment = {
   mime: string;
-  data_base64: string;
+  data_base64?: string;
   filename?: string;
+  id?: string;
+  url?: string;
+  size?: number;
+  transcript?: string;
+  transcript_lang?: string;
+  /** Set by listen-here, never by the hub: the transcript came from --stt-cmd. */
+  transcript_source?: "local";
 };
 
 type IncomingMessage = {
@@ -289,19 +314,130 @@ function safeBaseName(name: string): string {
   return cleaned || "attachment";
 }
 
+/** Uploaded files are capped at 10 MB by the hub; refuse anything bigger. */
+const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024;
+const DOWNLOAD_TIMEOUT_MS = 60_000;
+const STT_TIMEOUT_MS = 180_000;
+/** A transcript is a line in an inbox, not a document. */
+const MAX_TRANSCRIPT_CHARS = 8000;
+
+/** Fetch an uploaded attachment's bytes. Only from the hub we are connected
+ *  to: the url comes from a peer's message, and following an arbitrary one
+ *  would let any sender make this machine fetch what they like. */
+// Global fetch is fine here: the package requires Node >= 20 (cli.ts gates it).
+// The stream itself still uses node:http for its own reasons, see below.
+async function downloadAttachment(args: Args, att: WireAttachment): Promise<Buffer | null> {
+  if (!att.url) return null;
+  let url: URL;
+  try {
+    url = new URL(att.url, args.origin);
+  } catch {
+    return null;
+  }
+  if (url.origin !== new URL(args.origin).origin) {
+    console.error(`[listen-here] not fetching attachment from foreign origin ${url.origin}`);
+    return null;
+  }
+  try {
+    const r = await fetch(url, { signal: AbortSignal.timeout(DOWNLOAD_TIMEOUT_MS) });
+    if (!r.ok) {
+      console.error(`[listen-here] attachment ${att.id ?? url.pathname} HTTP ${r.status}`);
+      return null;
+    }
+    const buf = Buffer.from(await r.arrayBuffer());
+    if (buf.length > MAX_DOWNLOAD_BYTES) return null;
+    return buf;
+  } catch (err) {
+    console.error(`[listen-here] attachment download failed:`, (err as Error).message);
+    return null;
+  }
+}
+
+function onPath(cmd: string): boolean {
+  for (const dir of (process.env.PATH ?? "").split(delimiter)) {
+    if (dir && existsSync(join(dir, cmd))) return true;
+  }
+  return false;
+}
+
+/** Run a shell command with the audio path in $RR_AUDIO (never interpolated
+ *  into the command string, so a hostile filename can't inject anything) and
+ *  return its stdout. */
+function runStt(cmd: string, audio: string, extraEnv: Record<string, string> = {}): Promise<string | null> {
+  return new Promise((resolve) => {
+    const child = spawn(cmd, {
+      shell: true,
+      stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, ...extraEnv, RR_AUDIO: audio },
+    });
+    let out = "";
+    child.stdout.setEncoding("utf8");
+    child.stdout.on("data", (d: string) => {
+      if (out.length < MAX_TRANSCRIPT_CHARS * 4) out += d;
+    });
+    const timer = setTimeout(() => child.kill("SIGKILL"), STT_TIMEOUT_MS);
+    child.on("error", () => {
+      clearTimeout(timer);
+      resolve(null);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolve(code === 0 ? out : null);
+    });
+  });
+}
+
+/** Local speech-to-text, for audio the hub left without a transcript (its
+ *  transcription is off, timed out, or the audio came inline). Returns null
+ *  when there is no local engine or it failed; never throws. */
+async function transcribeLocally(args: Args, audio: string): Promise<string | null> {
+  if (args.sttCmd === null) return null;
+  let text: string | null = null;
+  if (args.sttCmd) {
+    text = await runStt(args.sttCmd, audio);
+  } else if (onPath("whisper")) {
+    // openai-whisper writes <name>.txt into --output_dir; read it back instead
+    // of parsing its chatty stdout. `base` is the small multilingual model.
+    const outDir = mkdtempSync(join(tmpdir(), "apuchat-stt-"));
+    try {
+      const ok = await runStt(
+        'whisper "$RR_AUDIO" --model base --output_format txt --output_dir "$RR_STT_OUT" --fp16 False --verbose False',
+        audio,
+        { RR_STT_OUT: outDir },
+      );
+      if (ok !== null) {
+        const txt = readdirSync(outDir).find((f) => f.endsWith(".txt"));
+        if (txt) text = readFileSync(join(outDir, txt), "utf8");
+      }
+    } finally {
+      rmSync(outDir, { recursive: true, force: true });
+    }
+  } else {
+    return null;
+  }
+  if (text === null) return null;
+  return text.replace(/\s+/g, " ").trim().slice(0, MAX_TRANSCRIPT_CHARS);
+}
+
 /** Save attachments to disk alongside the inbox file. Returns the saved file
  *  paths (in attachment order). Without --inbox we have no directory context,
  *  so skip the save and return an empty list — the line still surfaces
  *  metadata so the agent knows something arrived.
  *
+ *  Inline attachments are decoded; uploaded ones (url, no bytes) are fetched
+ *  from the hub. Audio that arrives without a hub transcript is transcribed
+ *  locally when an engine is available, and the text is written back onto
+ *  the attachment (`transcript`, `transcript_source: "local"`) so the line
+ *  the agent reads carries it either way.
+ *
  *  Layout: if inbox is `/tmp/rr-X.log`, attachments go in
  *  `/tmp/rr-X-attachments/<msg_id>-<idx>-<safe_filename>`. This puts the
  *  binaries next to the line that announces them so an agent monitoring the
  *  inbox via tail can Read them by path directly. */
-function saveAttachments(
+async function saveAttachments(
   args: Args,
   msg: IncomingMessage,
-): string[] {
+): Promise<string[]> {
   if (!args.inbox || !msg.attachments || msg.attachments.length === 0) return [];
   // Strip a trailing extension so `/tmp/rr-X.log` → `/tmp/rr-X-attachments`.
   const inboxDir = dirname(args.inbox);
@@ -316,13 +452,25 @@ function saveAttachments(
   const saved: string[] = [];
   for (let i = 0; i < msg.attachments.length; i++) {
     const att = msg.attachments[i];
+    const bytes = att.data_base64
+      ? Buffer.from(att.data_base64, "base64")
+      : await downloadAttachment(args, att);
+    if (!bytes) continue;
     const safeName = safeBaseName(att.filename ?? `att-${i}`);
     const path = join(attDir, `${msg.id}-${i}-${safeName}`);
     try {
-      writeFileSync(path, Buffer.from(att.data_base64, "base64"), { mode: 0o600 });
+      writeFileSync(path, bytes, { mode: 0o600 });
       saved.push(path);
     } catch (err) {
       console.error(`[listen-here] failed to save attachment ${path}:`, (err as Error).message);
+      continue;
+    }
+    if (att.mime.startsWith("audio/") && att.transcript === undefined) {
+      const text = await transcribeLocally(args, path);
+      if (text !== null) {
+        att.transcript = text;
+        att.transcript_source = "local";
+      }
     }
   }
   return saved;
@@ -385,15 +533,21 @@ function formatLine(args: Args, msg: IncomingMessage, savedPaths: string[]): str
     // files, but we still announce that attachments arrived so the agent
     // can fall back to the JSONL stream or `history` over MCP to fetch them.
     let attTag = "";
+    // A voice note is opaque to an agent; what it said is the transcript
+    // (the hub's, or a local one). Printed in full so the line is enough.
+    const said = (msg.attachments ?? [])
+      .filter((a) => a.mime.startsWith("audio/") && a.transcript)
+      .map((a) => `  🎤 "${a.transcript!.replace(/\r?\n/g, " ").trim()}"`)
+      .join("");
     if (savedPaths.length > 0) {
       attTag = "  📎 " + savedPaths.join(", ");
     } else if (msg.attachments && msg.attachments.length > 0) {
       const summary = msg.attachments
         .map((a) => `${a.mime}${a.filename ? ` "${a.filename}"` : ""}`)
         .join(", ");
-      attTag = `  📎 (${msg.attachments.length} inline, not saved: ${summary})`;
+      attTag = `  📎 (${msg.attachments.length} not saved: ${summary})`;
     }
-    return `${prio}[${msg.from}] ${flat}${replies}${attTag}`;
+    return `${prio}[${msg.from}] ${flat}${said}${replies}${attTag}`;
   }
   // JSONL: pass the wire shape through, plus saved_paths so a jq consumer can
   // pick the on-disk locations without re-base64-decoding the body.
@@ -435,7 +589,7 @@ async function dispatch(args: Args, msg: IncomingMessage): Promise<void> {
   // Save inline attachments to disk (alongside the inbox) BEFORE writing the
   // line, so the path the line announces actually exists when the agent's
   // Monitor tool fires on the new tail entry.
-  const savedPaths = saveAttachments(args, msg);
+  const savedPaths = await saveAttachments(args, msg);
   const line = formatLine(args, msg, savedPaths);
   if (args.inbox) {
     const dir = dirname(args.inbox);
@@ -472,6 +626,12 @@ async function dispatch(args: Args, msg: IncomingMessage): Promise<void> {
         // string when no attachments arrived OR when --inbox wasn't set (no
         // directory context to save into).
         RR_ATTACHMENTS: savedPaths.join("\t"),
+        // Transcripts of the voice notes in this message (hub or local),
+        // newline-separated, in attachment order. Empty when there are none.
+        RR_TRANSCRIPT: (msg.attachments ?? [])
+          .filter((a) => a.mime.startsWith("audio/") && a.transcript)
+          .map((a) => a.transcript)
+          .join("\n"),
       },
     });
     child.on("error", (err) => {
