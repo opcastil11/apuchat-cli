@@ -477,9 +477,9 @@ async function saveAttachments(
 }
 
 /** Yield one SSE block (the lines between two blank-line separators) at a time.
- *  Takes a Node IncomingMessage rather than a Fetch-style ReadableStream so we
- *  don't need global `fetch` — listen-here must run on Node 16, which lacks
- *  it. IncomingMessage is async-iterable since Node 10. */
+ *  Takes a Node IncomingMessage (async-iterable) rather than a Fetch-style
+ *  ReadableStream: the long-lived stream predates the Node >= 20 floor and the
+ *  node:http path is the one the reconnect logic and tests exercise. */
 async function* readSseBlocks(body: HttpResponse): AsyncGenerator<string> {
   body.setEncoding("utf8");
   let buffer = "";
@@ -640,8 +640,9 @@ async function dispatch(args: Args, msg: IncomingMessage): Promise<void> {
   }
 }
 
-/** Issue a GET request and return the IncomingMessage. We use node:https/http
- *  directly (instead of global `fetch`) so listen-here works on Node 16. */
+/** Issue a GET request and return the IncomingMessage, via node:https/http.
+ *  (Originally to support Node 16; kept for the SSE stream now that the
+ *  package requires Node >= 20 — one-shot downloads use global fetch.) */
 function openHttpStream(
   url: URL,
   headers: Record<string, string>,
